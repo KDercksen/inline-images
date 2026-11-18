@@ -10,6 +10,8 @@ Tool output is never searched for image paths, so a search, listing or shell com
 
 Images are converted to PNG with macOS `sips` into `~/.cache/claude-inline-images` and drawn by the terminal from that file. Nothing leaves the machine.
 
+Animated GIFs play inline when `ffmpeg` is installed (`brew install ffmpeg`): their frames (up to 300, at most 800 px on a side) are extracted into the same cache and swapped in at the GIF's own frame delays. Up to 6 play at once; an animation stops when it scrolls out of view and resumes when drawn again. Without `ffmpeg` a GIF shows its first frame.
+
 Requires a terminal Claude Code draws images in: Ghostty (including cmux), or kitty 0.28+. Not inside tmux or screen.
 
 Requires macOS (conversion uses the built-in `sips`) and a Claude Code build with mods (function-hooks plugins).

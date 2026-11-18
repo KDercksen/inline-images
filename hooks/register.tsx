@@ -26,13 +26,30 @@ const MAX_SIDE = 1600
 /** Files larger than this are not converted. */
 const MAX_FILE_BYTES = 50 * 1024 * 1024
 const EXT = 'png|jpe?g|gif|webp|heic|bmp|tiff?'
+/** Animated GIFs: at most this many frames are played, each no larger than ANIM_SIDE. */
+const MAX_FRAMES = 300
+const ANIM_SIDE = 800
+/** Animations playing at once; any more draw their first frame still. */
+const MAX_PLAYING = 6
+/** A frame delay this short or shorter plays at DEFAULT_DELAY, as browsers do. */
+const MIN_DELAY = 10
+const DEFAULT_DELAY = 100
 
 const pasted = atom({ plugin: 'inline-images', key: 'pasted' } as const, [] as Pasted[], {
   shape: 'pasted-1',
 })
 
-/** `file` is the PNG drawn; `original` the file a click opens at full size. */
-type Prepared = { file: string; width: number; height: number; original: string }
+/**
+ * `file` is the PNG drawn; `original` the file a click opens at full size.
+ * An animated GIF also has its frames (PNGs, `file` the first) and their delays in ms.
+ */
+type Prepared = {
+  file: string
+  width: number
+  height: number
+  original: string
+  frames?: { files: string[]; delays: number[] }
+}
 type Inline = { data: string; mime: string }
 
 // ---------------------------------------------------------------------------
@@ -87,8 +104,72 @@ async function probe($: EngineInterface, file: string): Promise<{ width: number;
   return out.exitCode === 0 && width > 0 && height > 0 ? { width, height } : null
 }
 
+const tools = new Map<string, Promise<string | null>>()
+
+/** The full path of a command-line tool, looking in Homebrew's folders too; null when absent. */
+function findTool($: EngineInterface, name: string): Promise<string | null> {
+  let found = tools.get(name)
+  if (!found) {
+    found = $.process
+      .run(['sh', '-c', 'PATH="$PATH:/opt/homebrew/bin:/usr/local/bin" command -v "$1"', 'sh', name])
+      .then(out => (out.exitCode === 0 && out.stdout.trim().startsWith('/') ? out.stdout.trim() : null))
+      .catch(() => null)
+    tools.set(name, found)
+  }
+  return found
+}
+
+/**
+ * The frames of an animated GIF as PNGs in the cache, with their delays; null
+ * for a GIF of one frame, or without ffmpeg, so the caller draws it still.
+ */
+async function toFrames($: EngineInterface, source: string, name: string): Promise<Prepared | null> {
+  const [ffmpeg, ffprobe] = await Promise.all([findTool($, 'ffmpeg'), findTool($, 'ffprobe')])
+  if (!ffmpeg || !ffprobe) return null
+
+  const probed = await $.process.run([
+    ffprobe, '-v', 'error', '-select_streams', 'v:0', '-read_intervals', `%+#${MAX_FRAMES}`,
+    '-show_entries', 'frame=duration_time,pkt_duration_time', '-of', 'csv=p=0', source,
+  ])
+  if (probed.exitCode !== 0) return null
+  const delays = probed.stdout
+    .split('\n')
+    .filter(line => line.trim() !== '')
+    .slice(0, MAX_FRAMES)
+    .map(line => {
+      const seconds = line.split(',').map(Number).find(n => Number.isFinite(n))
+      const ms = Math.round((seconds ?? 0) * 1000)
+      return ms <= MIN_DELAY ? DEFAULT_DELAY : ms
+    })
+  if (delays.length < 2) return null
+
+  const dir = `${await ensureCacheDir($)}/${name}.frames`
+  const marker = `${dir}/done`
+  if (!(await $.fs.exists(marker))) {
+    const made = await $.process.run([
+      'sh', '-c',
+      'rm -rf "$2" && mkdir -p "$2" && "$1" -v error -nostdin -i "$3" -frames:v "$4" -fps_mode passthrough ' +
+        '-vf "$5" "$2/%04d.png" && touch "$2/done"',
+      'sh', ffmpeg, dir, source, String(MAX_FRAMES),
+      `scale=w='min(${ANIM_SIDE},iw)':h='min(${ANIM_SIDE},ih)':force_original_aspect_ratio=decrease`,
+    ])
+    if (made.exitCode !== 0) return null
+  }
+  const listed = await $.process.run(['sh', '-c', 'ls "$1" | grep -c "\\.png$"', 'sh', dir])
+  const count = Math.min(Number(listed.stdout.trim()) || 0, delays.length)
+  if (count < 2) return null
+
+  const files = Array.from({ length: count }, (_, i) => `${dir}/${String(i + 1).padStart(4, '0')}.png`)
+  const size = await probe($, files[0]!)
+  return size && { file: files[0]!, original: source, ...size, frames: { files, delays: delays.slice(0, count) } }
+}
+
 /** A PNG of `source` no larger than MAX_SIDE, in the cache unless the source already is one. */
 async function toPng($: EngineInterface, source: string, name: string): Promise<Prepared | null> {
+  if (/\.gif$/i.test(source)) {
+    const animated = await toFrames($, source, name).catch(() => null)
+    if (animated) return animated
+  }
   const original = source
   const dir = await ensureCacheDir($)
   const out = `${dir}/${name}.png`
@@ -210,6 +291,53 @@ function fit(width: number, height: number, maxColumns: number, maxRows: number)
   return { columns: Math.min(255, columns), rows: Math.min(255, rows) }
 }
 
+// ---------------------------------------------------------------------------
+// Playing animations: a keyed Image whose source a timer swaps with $.ui.blit.
+
+type Playing = { at: number; timer?: { cancel: () => void } }
+/** By `<requestId>\0<key>`: the frame shown, so a redraw draws it rather than frame one. */
+const playing = new Map<string, Playing>()
+
+/** The frame a site's animation shows now (0 when it is not playing). */
+function frameAt(requestId: string, key: string): number {
+  return playing.get(`${requestId}\0${key}`)?.at ?? 0
+}
+
+/**
+ * Plays `frames` in the Image `key` of site `requestId`, unless it already
+ * plays or MAX_PLAYING others do. It stops when a swap is refused once the
+ * Image has been seen (scrolled away, redrawn smaller); a later draw starts it
+ * again. Swaps refused before the first one lands are the Image not yet mounted.
+ */
+function play($: EngineInterface, requestId: string, key: string, frames: { files: string[]; delays: number[] }) {
+  const id = `${requestId}\0${key}`
+  if (playing.has(id) || playing.size >= MAX_PLAYING) return
+  const state: Playing = { at: 0 }
+  playing.set(id, state)
+  let landed = false
+  let misses = 0
+  const stop = () => {
+    state.timer?.cancel()
+    if (playing.get(id) === state) playing.delete(id)
+  }
+  const schedule = () => {
+    state.timer = $.clock.after(frames.delays[state.at] ?? DEFAULT_DELAY, () => {
+      const next = (state.at + 1) % frames.files.length
+      $.ui.blit({ requestId, key, source: { file: frames.files[next]!, format: 'png' } }).then(result => {
+        if (playing.get(id) !== state) return
+        if (result.deny === undefined) {
+          landed = true
+          state.at = next
+        } else if (landed || ++misses > 50) {
+          return stop()
+        }
+        schedule()
+      }, stop)
+    })
+  }
+  schedule()
+}
+
 /**
  * The engine's own row with the ready pictures of `sources` under it: one at
  * full size, several as a grid of thumbnails. Sources still converting start a
@@ -233,11 +361,17 @@ async function withPictures(
   const shown = ready.slice(0, MAX_SHOWN)
   const hidden = ready.length - shown.length
 
-  const cell = ({ source, picture }: { source: Source; picture: Prepared }, columns: number, rows: number, label: string) => {
+  const cell = ({ source, picture }: { source: Source; picture: Prepared }, columns: number, rows: number, label: string, index: number) => {
     const size = fit(picture.width, picture.height, columns, rows)
+    const key = `picture-${index}`
+    let file = picture.file
+    if (picture.frames) {
+      file = picture.frames.files[frameAt(e.requestId, key)] ?? picture.file
+      play($, e.requestId, key, picture.frames)
+    }
     return (
       <Box flexDirection="column" width={columns}>
-        <Image source={{ file: picture.file, format: 'png' }} columns={size.columns} rows={size.rows} alt={`[image: ${source.label}]`} />
+        <Image key={key} source={{ file, format: 'png' }} columns={size.columns} rows={size.rows} alt={`[image: ${source.label}]`} />
         <Link href={`file://${encodeURI(picture.original)}`} label={label} />
       </Box>
     )
@@ -245,7 +379,7 @@ async function withPictures(
 
   let body
   if (shown.length === 1) {
-    body = cell(shown[0]!, room, MAX_ROWS, 'open full size')
+    body = cell(shown[0]!, room, MAX_ROWS, 'open full size', 0)
   } else {
     const perRow = Math.max(1, Math.min(shown.length, Math.floor((room + GAP) / (THUMB_COLUMNS + GAP))))
     const width = Math.floor((room - GAP * (perRow - 1)) / perRow)
@@ -253,7 +387,7 @@ async function withPictures(
     for (let at = 0; at < shown.length; at += perRow) {
       lines.push(
         <Box flexDirection="row" columnGap={GAP}>
-          {shown.slice(at, at + perRow).map(one => cell(one, width, THUMB_ROWS, 'open'))}
+          {shown.slice(at, at + perRow).map((one, i) => cell(one, width, THUMB_ROWS, 'open', at + i))}
         </Box>,
       )
     }
