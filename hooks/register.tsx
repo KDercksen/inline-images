@@ -4,16 +4,23 @@ import type { EngineInterface, Register, RenderElement, RenderInput } from 'clau
 import type { Pasted } from '../types'
 
 // Draws pictures inline in the terminal transcript, with no command to run:
-// - images pasted into a prompt, under that prompt's row;
+// - images pasted into a prompt (and image paths typed in it), under that prompt;
 // - image paths Claude writes in a reply, under that reply block;
-// - images a tool returns (browser screenshots, Read of a PNG) and image paths
-//   in a tool's output (a saved GIF, a screencapture), under the result.
+// - screenshots a browser or computer-use (MCP) tool returns, under the result.
+// Tool output is never searched for paths: a listing or search stays text.
 // Everything is converted to PNG with macOS `sips` into a private cache folder
 // and handed to the terminal by file name; nothing leaves the machine.
 
 const MAX_COLUMNS = 80
 const MAX_ROWS = 24
-const MAX_PER_ROW = 4
+/** Pictures drawn under one row; any more ready ones are counted in a "+N more" line. */
+const MAX_SHOWN = 12
+/** Sources looked at per row (a job each), so a long list of paths stays bounded. */
+const MAX_CHECKED = 50
+/** Several pictures draw as a grid of thumbnails about this wide, at most this tall. */
+const THUMB_COLUMNS = 26
+const THUMB_ROWS = 12
+const GAP = 2
 /** Longest side of the PNG handed to the terminal. */
 const MAX_SIDE = 1600
 /** Files larger than this are not converted. */
@@ -174,16 +181,6 @@ function imagesIn(output: unknown, depth = 0): Inline[] {
   return ['content', 'result', 'file'].flatMap(key => imagesIn(output[key], depth + 1))
 }
 
-/** Text a tool's output carries, for paths; image data left out. */
-function textOf(output: unknown): string {
-  if (typeof output === 'string') return output
-  try {
-    return JSON.stringify(output, (key, value) => (key === 'data' || key === 'base64' ? undefined : value)) ?? ''
-  } catch {
-    return ''
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Drawing.
 
@@ -214,8 +211,9 @@ function fit(width: number, height: number, maxColumns: number, maxRows: number)
 }
 
 /**
- * The engine's own row with the ready pictures of `sources` under it. Sources
- * still converting start a job that redraws; ones that fail draw nothing.
+ * The engine's own row with the ready pictures of `sources` under it: one at
+ * full size, several as a grid of thumbnails. Sources still converting start a
+ * job that redraws; ones that fail (a path that is no image) draw nothing.
  */
 async function withPictures(
   $: EngineInterface,
@@ -225,25 +223,50 @@ async function withPictures(
   indent: number,
 ): Promise<RenderElement> {
   const ready = sources
-    .slice(0, MAX_PER_ROW)
+    .slice(0, MAX_CHECKED)
     .map(source => ({ source, picture: peek($, source.key, source.job) }))
     .filter((one): one is { source: Source; picture: Prepared } => !!one.picture)
   if (ready.length === 0) return row
 
-  const { Box, Image, Link } = $.ui.resolve(e) as any
+  const { Box, Image, Link, Text } = $.ui.resolve(e) as any
   const room = Math.max(10, Math.min(MAX_COLUMNS, (e.viewport?.columns ?? 100) - indent - 2))
+  const shown = ready.slice(0, MAX_SHOWN)
+  const hidden = ready.length - shown.length
+
+  const cell = ({ source, picture }: { source: Source; picture: Prepared }, columns: number, rows: number, label: string) => {
+    const size = fit(picture.width, picture.height, columns, rows)
+    return (
+      <Box flexDirection="column" width={columns}>
+        <Image source={{ file: picture.file, format: 'png' }} columns={size.columns} rows={size.rows} alt={`[image: ${source.label}]`} />
+        <Link href={`file://${encodeURI(picture.original)}`} label={label} />
+      </Box>
+    )
+  }
+
+  let body
+  if (shown.length === 1) {
+    body = cell(shown[0]!, room, MAX_ROWS, 'open full size')
+  } else {
+    const perRow = Math.max(1, Math.min(shown.length, Math.floor((room + GAP) / (THUMB_COLUMNS + GAP))))
+    const width = Math.floor((room - GAP * (perRow - 1)) / perRow)
+    const lines = []
+    for (let at = 0; at < shown.length; at += perRow) {
+      lines.push(
+        <Box flexDirection="row" columnGap={GAP}>
+          {shown.slice(at, at + perRow).map(one => cell(one, width, THUMB_ROWS, 'open'))}
+        </Box>,
+      )
+    }
+    body = <Box flexDirection="column" rowGap={1}>{lines}</Box>
+  }
+
   return (
     (<Box flexDirection="column">
       {row}
-      {ready.map(({ source, picture }) => {
-        const size = fit(picture.width, picture.height, room, MAX_ROWS)
-        return (
-          <Box paddingLeft={indent} flexDirection="column">
-            <Image source={{ file: picture.file, format: 'png' }} columns={size.columns} rows={size.rows} alt={`[image: ${source.label}]`} />
-            <Link href={`file://${encodeURI(picture.original)}`} label="open full size" />
-          </Box>
-        )
-      })}
+      <Box paddingLeft={indent} flexDirection="column">
+        {body}
+        {hidden > 0 && <Text dimColor>+{hidden} more</Text>}
+      </Box>
     </Box>) as RenderElement
   )
 }
@@ -305,23 +328,14 @@ export const register: Register = on => {
     return withPictures($, e, row, pathsIn(e.props.text).map(path => fileSource($, path)), 2)
   })
 
+  // Screenshots a browser or computer-use tool sends back as image data (an
+  // MCP tool's result). Paths in tool output (search, ls, Bash) are never
+  // drawn, and neither are Reads of images: only what Claude puts forward in
+  // a reply, and these screenshots, which have no path to put forward.
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
     const row = await next(e)
-    if (e.surface !== 'terminal' || e.props.isErrored) return row
-    const sources = [
-      ...imagesIn(e.props.output).map((image, i) => inlineSource($, image, `${e.props.tool} image ${i + 1}`)),
-      ...pathsIn(textOf(e.props.output)).map(path => fileSource($, path)),
-    ]
-    return withPictures($, e, row, sources, 5)
-  })
-
-  // Reads of images often fold into one "Read 2 files" line: draw them under it.
-  on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
-    const row = await next(e)
-    if (e.surface !== 'terminal' || e.props.isExpanded) return row
-    const sources = e.props.calls
-      .filter(call => !call.isErrored && call.output !== undefined)
-      .flatMap(call => imagesIn(call.output).map((image, i) => inlineSource($, image, `${call.tool} image ${i + 1}`)))
+    if (e.surface !== 'terminal' || e.props.isErrored || !e.props.tool.startsWith('mcp__')) return row
+    const sources = imagesIn(e.props.output).map((image, i) => inlineSource($, image, `screenshot ${i + 1}`))
     return withPictures($, e, row, sources, 5)
   })
 }

@@ -4,7 +4,9 @@ A Claude Code mod that draws images inline in the terminal transcript, with no c
 
 - images pasted into a prompt, under that prompt's row;
 - image paths Claude writes in a reply (absolute, `~/`, relative, in backticks or markdown links), under that reply;
-- images a tool returns (browser or MCP screenshots, Read of a PNG) and image paths in a tool's output, under the result.
+- screenshots a browser or computer-use (MCP) tool returns as image data, under the result.
+
+Tool output is never searched for image paths, so a search, listing or shell command stays text: an image shows when Claude names it in its reply. Several images draw as a grid of thumbnails (up to 12, then a "+N more" line); each has a link that opens the original file.
 
 Images are converted to PNG with macOS `sips` into `~/.cache/claude-inline-images` and drawn by the terminal from that file. Nothing leaves the machine.
 
