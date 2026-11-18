@@ -1,0 +1,17 @@
+{
+  "name": "inline-images",
+  "owner": {
+    "name": "KDercksen",
+    "url": "https://github.com/KDercksen"
+  },
+  "plugins": [
+    {
+      "name": "inline-images",
+      "source": "./",
+      "description": "Draws pasted images, image paths in replies and tool screenshots inline in the terminal transcript"
+    }
+  ],
+  "metadata": {
+    "description": "Inline images in the Claude Code terminal transcript"
+  }
+}
