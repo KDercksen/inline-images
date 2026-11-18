@@ -1,6 +1,6 @@
 {
   "name": "inline-images",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Draws images inline in the transcript: pasted images, image paths in replies, and screenshots tools return",
   "author": { "name": "KDercksen", "url": "https://github.com/KDercksen" },
   "repository": "https://github.com/KDercksen/inline-images",
